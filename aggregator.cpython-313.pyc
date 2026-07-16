@@ -1,0 +1,186 @@
+"""
+Push-pull gossip engine.
+
+Protocol (per round):
+  1. Randomly select `gossip_fanout` peers from the peer list.
+  2. PUSH  — POST /model with our current weights.
+  3. PULL  — GET  /model to fetch the peer's current weights.
+  4. Aggregate received weights with our own via the provided callback.
+
+Peers that are unreachable are silently skipped; the rest of the round
+continues normally.  The failure is logged and tracked in peer_status so
+the dashboard can visualise node health.
+"""
+import asyncio
+import random
+import logging
+import time
+from typing import Callable, Dict, List, Optional, Any
+
+import aiohttp
+
+from config import NodeConfig
+
+logger = logging.getLogger(__name__)
+
+WeightDict = Dict[str, Any]
+
+
+class GossipEngine:
+    def __init__(
+        self,
+        config: NodeConfig,
+        get_weights_fn: Callable[[], WeightDict],
+        aggregate_fn: Callable[[List[WeightDict]], None],
+    ):
+        self.config = config
+        self.get_weights = get_weights_fn
+        self.aggregate = aggregate_fn
+
+        self.peers: List[str] = list(config.peers)
+        self.peer_status: Dict[str, bool] = {p: True for p in self.peers}
+        self.peer_last_seen: Dict[str, Optional[float]] = {p: None for p in self.peers}
+
+        self.stats: Dict[str, Any] = {
+            "rounds": 0,
+            "successful_exchanges": 0,
+            "failed_exchanges": 0,
+            "last_gossip_ts": None,
+            "exchange_log": [],        # last 20 events for dashboard
+        }
+        self._running = False
+
+    # ── Peer management ──────────────────────────────────────────────────────
+
+    def add_peer(self, url: str) -> None:
+        if url not in self.peers:
+            self.peers.append(url)
+            self.peer_status[url] = True
+            self.peer_last_seen[url] = None
+            logger.info("Added peer: %s", url)
+
+    def remove_peer(self, url: str) -> None:
+        if url in self.peers:
+            self.peers.remove(url)
+            self.peer_status.pop(url, None)
+            self.peer_last_seen.pop(url, None)
+            logger.info("Removed peer: %s", url)
+
+    # ── Single-peer exchange ─────────────────────────────────────────────────
+
+    async def _exchange_with_peer(
+        self,
+        session: aiohttp.ClientSession,
+        peer_url: str,
+    ) -> Optional[WeightDict]:
+        """
+        Attempt push-then-pull with one peer.
+        Returns the peer's weight dict, or None on any failure.
+        """
+        timeout = aiohttp.ClientTimeout(total=30)
+        try:
+            # ── PUSH ───────────────────────────────────────────────────────
+            payload = {
+                "weights": self.get_weights(),
+                "node_id": self.config.node_id,
+            }
+            async with session.post(
+                f"{peer_url}/model", json=payload, timeout=timeout
+            ) as resp:
+                if resp.status not in (200, 201):
+                    raise RuntimeError(f"push HTTP {resp.status}")
+
+            # ── PULL ───────────────────────────────────────────────────────
+            async with session.get(
+                f"{peer_url}/model", timeout=timeout
+            ) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"pull HTTP {resp.status}")
+                data = await resp.json()
+
+            self.peer_status[peer_url] = True
+            self.peer_last_seen[peer_url] = time.time()
+            return data.get("weights")
+
+        except Exception as exc:
+            logger.warning("Exchange with %s failed: %s", peer_url, exc)
+            self.peer_status[peer_url] = False
+            self.stats["failed_exchanges"] += 1
+            self._log_event(f"✗ {peer_url} unreachable")
+            return None
+
+    # ── Gossip round ──────────────────────────────────────────────────────────
+
+    async def gossip_round(self) -> Dict[str, Any]:
+        """One full gossip round: contact fanout random peers and aggregate."""
+        if not self.peers:
+            return {"status": "no_peers"}
+
+        selected = random.sample(
+            self.peers, k=min(self.config.gossip_fanout, len(self.peers))
+        )
+        self.stats["rounds"] += 1
+        self.stats["last_gossip_ts"] = time.time()
+
+        logger.info(
+            "Gossip round %d → %s", self.stats["rounds"], selected
+        )
+
+        async with aiohttp.ClientSession() as session:
+            tasks = [self._exchange_with_peer(session, p) for p in selected]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        received: List[WeightDict] = [
+            r for r in results if isinstance(r, dict)
+        ]
+
+        if received:
+            self.aggregate(received)
+            self.stats["successful_exchanges"] += len(received)
+            self._log_event(f"↔ aggregated {len(received)} peer(s)")
+
+        return {
+            "round": self.stats["rounds"],
+            "contacted": len(selected),
+            "received": len(received),
+        }
+
+    # ── Background loop ───────────────────────────────────────────────────────
+
+    async def run(self) -> None:
+        self._running = True
+        logger.info(
+            "Gossip engine started (interval=%ds, fanout=%d)",
+            self.config.gossip_interval,
+            self.config.gossip_fanout,
+        )
+        # Give other nodes a moment to start up
+        await asyncio.sleep(8)
+
+        while self._running:
+            try:
+                await self.gossip_round()
+            except Exception as exc:
+                logger.error("Gossip loop error: %s", exc)
+            await asyncio.sleep(self.config.gossip_interval)
+
+    def stop(self) -> None:
+        self._running = False
+
+    # ── Stats / helpers ────────────────────────────────────────────────────────
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            **self.stats,
+            "peers": self.peers,
+            "peer_status": self.peer_status,
+            "peer_last_seen": self.peer_last_seen,
+        }
+
+    def _log_event(self, msg: str) -> None:
+        self.stats["exchange_log"].append(
+            {"ts": time.time(), "msg": msg}
+        )
+        # Keep only last 20 entries
+        if len(self.stats["exchange_log"]) > 20:
+            self.stats["exchange_log"] = self.stats["exchange_log"][-20:]

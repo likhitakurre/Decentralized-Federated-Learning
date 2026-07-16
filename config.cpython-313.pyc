@@ -1,0 +1,274 @@
+"""
+Decentralized Federated Learning — Edge Node
+============================================
+Each Raspberry Pi runs this process.
+
+Endpoints
+─────────
+GET  /health            → liveness probe
+GET  /status            → full node status + metrics history
+GET  /model             → current model weights (JSON)
+POST /model             → receive model weights pushed by a peer
+GET  /peers             → peer list & reachability
+POST /peers             → dynamically add a peer
+DELETE /peers/{url}     → remove a peer
+GET  /metrics           → training history (array of round metrics)
+POST /train/trigger     → manually kick off a training round
+POST /gossip/trigger    → manually kick off a gossip round
+"""
+
+import asyncio
+import logging
+import time
+from typing import Any, Dict, List, Optional
+
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from aggregator import federated_average
+from config import NodeConfig
+from data_loader import get_data_loaders
+from gossip import GossipEngine
+from model import FLModel
+from trainer import LocalTrainer
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  [%(name)s]  %(message)s",
+)
+logger = logging.getLogger("fl_node")
+
+# ─── App ──────────────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title="FL Edge Node",
+    description="Decentralized Federated Learning node using gossip communication.",
+    version="1.0.0",
+)
+
+# ─── Globals (populated on startup) ──────────────────────────────────────────
+
+config: NodeConfig = NodeConfig()
+model: FLModel = FLModel()
+trainer: Optional[LocalTrainer] = None
+gossip_engine: Optional[GossipEngine] = None
+
+node_state: Dict[str, Any] = {
+    "status": "initializing",
+    "start_time": time.time(),
+    "rounds_trained": 0,
+    "last_train_ts": None,
+    "last_gossip_ts": None,
+}
+
+
+# ─── Pydantic schemas ─────────────────────────────────────────────────────────
+
+class ModelPayload(BaseModel):
+    weights: Dict[str, Any]
+    node_id: Optional[str] = None
+    num_samples: Optional[int] = None
+
+
+class PeerBody(BaseModel):
+    url: str
+
+
+# ─── CORS ─────────────────────────────────────────────────────────────────────
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ─── Lifecycle ────────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup() -> None:
+    global trainer, gossip_engine
+
+    logger.info("═" * 60)
+    logger.info("Node ID   : %s", config.node_id)
+    logger.info("Port      : %d", config.port)
+    logger.info("Partition : %d  (non_iid=%s)", config.data_partition, config.non_iid)
+    logger.info("Peers     : %s", config.peers)
+    logger.info("═" * 60)
+
+    node_state["status"] = "loading_data"
+    train_loader, test_loader = get_data_loaders(config)
+    logger.info("Loaded %d training samples", len(train_loader.dataset))
+
+    trainer = LocalTrainer(model, train_loader, test_loader, config)
+
+    gossip_engine = GossipEngine(
+        config=config,
+        get_weights_fn=model.get_weights,
+        aggregate_fn=_on_gossip_received,
+    )
+
+    node_state["status"] = "running"
+    asyncio.create_task(training_loop())
+    asyncio.create_task(gossip_engine.run())
+
+    logger.info("Node startup complete ✓")
+
+
+def _on_gossip_received(peer_weights_list: List[Dict]) -> None:
+    """Callback: aggregate peer models into our local model."""
+    averaged = federated_average(model.get_weights(), peer_weights_list)
+    model.set_weights(averaged)
+    node_state["last_gossip_ts"] = time.time()
+    logger.info("Model updated via FedAvg (%d peers)", len(peer_weights_list))
+
+
+async def training_loop() -> None:
+    """Background task: periodically run a local training round."""
+    await asyncio.sleep(5)   # let the server become ready first
+    loop = asyncio.get_event_loop()
+
+    while True:
+        try:
+            metrics = await loop.run_in_executor(None, trainer.train_one_round)
+            node_state["rounds_trained"] += 1
+            node_state["last_train_ts"] = time.time()
+        except Exception as exc:
+            logger.error("Training error: %s", exc)
+        await asyncio.sleep(config.train_interval)
+
+
+# ─── Routes ───────────────────────────────────────────────────────────────────
+
+@app.get("/health", tags=["meta"])
+def health() -> Dict:
+    return {
+        "node_id": config.node_id,
+        "status": node_state["status"],
+        "uptime_s": round(time.time() - node_state["start_time"], 1),
+    }
+
+
+@app.get("/status", tags=["meta"])
+def status() -> Dict:
+    eval_metrics: Dict = {}
+    if trainer:
+        try:
+            eval_metrics = trainer.evaluate()
+        except Exception:
+            pass
+
+    return {
+        "node_id": config.node_id,
+        "status": node_state["status"],
+        "port": config.port,
+        "uptime_s": round(time.time() - node_state["start_time"], 1),
+        "rounds_trained": node_state["rounds_trained"],
+        "last_train_ts": node_state["last_train_ts"],
+        "last_gossip_ts": node_state["last_gossip_ts"],
+        "training_config": {
+            "local_epochs": config.local_epochs,
+            "batch_size": config.batch_size,
+            "learning_rate": config.learning_rate,
+            "non_iid": config.non_iid,
+            "data_partition": config.data_partition,
+        },
+        "eval_metrics": eval_metrics,
+        "metrics_history": (trainer.metrics_history[-100:] if trainer else []),
+        "data_size": (len(trainer.train_loader.dataset) if trainer else 0),
+        "model_params": model.count_parameters(),
+        "gossip": (gossip_engine.get_stats() if gossip_engine else {}),
+    }
+
+
+@app.get("/model", tags=["fl"])
+def get_model() -> Dict:
+    return {
+        "node_id": config.node_id,
+        "weights": model.get_weights(),
+        "round": node_state["rounds_trained"],
+    }
+
+
+@app.post("/model", tags=["fl"])
+def receive_model(payload: ModelPayload) -> Dict:
+    """
+    Peer pushes its weights to us.
+    We acknowledge receipt; the gossip engine will pull and aggregate later.
+    (Storing pushed weights for immediate averaging is an optional enhancement.)
+    """
+    logger.info("Received weight push from %s", payload.node_id)
+    return {"status": "received", "node_id": config.node_id}
+
+
+@app.get("/peers", tags=["gossip"])
+def get_peers() -> Dict:
+    if not gossip_engine:
+        return {"peers": [], "peer_status": {}}
+    return {
+        "node_id": config.node_id,
+        "peers": gossip_engine.peers,
+        "peer_status": gossip_engine.peer_status,
+        "peer_last_seen": gossip_engine.peer_last_seen,
+    }
+
+
+@app.post("/peers", tags=["gossip"])
+def add_peer(body: PeerBody) -> Dict:
+    if not gossip_engine:
+        raise HTTPException(503, "Gossip engine not ready")
+    gossip_engine.add_peer(body.url)
+    return {"status": "added", "peer": body.url}
+
+
+@app.delete("/peers/{peer_url:path}", tags=["gossip"])
+def remove_peer(peer_url: str) -> Dict:
+    if not gossip_engine:
+        raise HTTPException(503, "Gossip engine not ready")
+    gossip_engine.remove_peer(peer_url)
+    return {"status": "removed", "peer": peer_url}
+
+
+@app.get("/metrics", tags=["training"])
+def get_metrics() -> Dict:
+    return {
+        "node_id": config.node_id,
+        "history": (trainer.metrics_history if trainer else []),
+    }
+
+
+@app.post("/train/trigger", tags=["training"])
+async def trigger_training() -> Dict:
+    if not trainer:
+        raise HTTPException(503, "Trainer not ready")
+    loop = asyncio.get_event_loop()
+    metrics = await loop.run_in_executor(None, trainer.train_one_round)
+    node_state["rounds_trained"] += 1
+    node_state["last_train_ts"] = time.time()
+    return {"status": "complete", "metrics": metrics}
+
+
+@app.post("/gossip/trigger", tags=["gossip"])
+async def trigger_gossip() -> Dict:
+    if not gossip_engine:
+        raise HTTPException(503, "Gossip engine not ready")
+    result = await gossip_engine.gossip_round()
+    return {"status": "complete", **result}
+
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host=config.host,
+        port=config.port,
+        log_level="info",
+        reload=False,
+    )
